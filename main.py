@@ -4,6 +4,8 @@ import os
 from flask import Flask
 from threading import Thread
 import json
+import re
+import asyncio
 
 # --- Flask Web Sunucusu (Render Uyumluluğu İçin) ---
 app = Flask('')
@@ -23,18 +25,21 @@ def keep_alive():
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Log kanalı verisini saklamak için basit bir dosya sistemi
+# Verileri saklamak için dosya sistemi
 LOG_DATA_FILE = "log_config.json"
 
-def load_log_config():
+def load_config():
     if os.path.exists(LOG_DATA_FILE):
         with open(LOG_DATA_FILE, "r") as f:
             return json.load(f)
     return {}
 
-def save_log_config(config):
+def save_config(config):
     with open(LOG_DATA_FILE, "w") as f:
         json.dump(config, f)
+
+# URL tespiti için Regex (Düzenli İfade)
+URL_REGEX = r"(https?:\/\/[^\s]+)"
 
 @bot.event
 async def on_ready():
@@ -45,40 +50,87 @@ async def on_ready():
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def log(ctx, channel: discord.TextChannel):
-    config = load_log_config()
-    config[str(ctx.guild.id)] = channel.id
-    save_log_config(config)
+    config = load_config()
+    if str(ctx.guild.id) not in config:
+        config[str(ctx.guild.id)] = {}
+    config[str(ctx.guild.id)]["log_channel"] = channel.id
+    save_config(config)
     await ctx.send(f"✅ Log kanalı başarıyla {channel.mention} olarak ayarlandı.")
 
-@log.error
-async def log_error(ctx, error):
+# --- Korunan Rol Ayarlama Komutu ---
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def rol(ctx, role: discord.Role):
+    config = load_config()
+    if str(ctx.guild.id) not in config:
+        config[str(ctx.guild.id)] = {}
+    config[str(ctx.guild.id)]["protected_role"] = role.id
+    save_config(config)
+    await ctx.send(f"🛡️ Korunan rol başarıyla {role.mention} olarak ayarlandı. Bu role sahip kişiler link veya everyone/here atarsa banlanacak.")
+
+# Hata Yönetimi
+@bot.event
+async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ Bu komutu kullanmak için 'Yönetici' yetkisine sahip olmalısınız.")
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("❌ Lütfen geçerli bir kanal etiketleyin veya ID girin. Örn: `!log #kanal`")
+        await ctx.send("❌ Geçersiz argüman! Örnek kullanım:\n`!log #kanal` veya `!rol @rol`")
 
-# --- Olay Takip Sistemleri ---
-
+# --- Log Gönderme Fonksiyonu (Rate Limit Korumalı) ---
 async def send_log(guild, embed):
-    config = load_log_config()
-    channel_id = config.get(str(guild.id))
+    config = load_config()
+    guild_data = config.get(str(guild.id), {})
+    channel_id = guild_data.get("log_channel")
+    
     if channel_id:
         channel = guild.get_channel(int(channel_id))
         if channel:
-            await channel.send(embed=embed)
+            try:
+                await channel.send(embed=embed)
+                await asyncio.sleep(1) # Rate limit yememek için her log arası 1 saniye bekleme
+            except discord.errors.HTTPException:
+                pass # Yoğun istek dalgalarında çökmesini önler
 
-# 1. Mesaj Takibi (Everyone/Here Etiketi)
+# --- Olay Takip Sistemleri ---
+
+# 1. Mesaj ve Link/Etiket Koruması
 @bot.event
 async def on_message(message):
-    if message.author.bot:
+    if message.author.bot or not message.guild:
         return
 
-    if "@everyone" in message.content or "@here" in message.content:
-        embed = discord.Embed(title="⚠️ Etiket Algılandı", color=discord.Color.red())
-        embed.add_field(name="Kullanıcı", value=message.author.mention, inline=True)
-        embed.add_field(name="Kanal", value=message.channel.mention, inline=True)
-        embed.add_field(name="Mesaj İçeriği", value=message.content, inline=False)
-        await send_log(message.guild, embed)
+    config = load_config()
+    guild_data = config.get(str(message.guild.id), {})
+    protected_role_id = guild_data.get("protected_role")
+
+    # Kullanıcıda korunan rol var mı kontrol et
+    has_protected_role = False
+    if protected_role_id:
+        has_protected_role = any(r.id == int(protected_role_id) for r in message.author.roles)
+
+    if has_protected_role:
+        contains_mention = "@everyone" in message.content or "@here" in message.content
+        contains_url = re.search(URL_REGEX, message.content)
+
+        if contains_mention or contains_url:
+            reason = "Korunan roldeyken yasaklı eylem (Link veya Everyone/Here Etiketi)"
+            try:
+                # Önce mesajı sil
+                await message.delete()
+                # Kullanıcıyı banla
+                await message.author.ban(reason=reason, delete_message_days=1)
+                
+                # Log Bilgisi Oluştur
+                embed = discord.Embed(title="🚨 Guard Sistemi: Kullanıcı Banlandı!", color=discord.Color.red())
+                embed.add_field(name="Kullanıcı", value=f"{message.author.mention} ({message.author.id})", inline=False)
+                embed.add_field(name="Sebep", value="Korumalı rolde olmasına rağmen link paylaştı veya etiket attı.", inline=False)
+                embed.add_field(name="İçerik", value=f"||{message.content}||", inline=False)
+                await send_log(message.guild, embed)
+                return # Tetiklenme durumunda komut işlemeyi durdur
+            except discord.Forbidden:
+                print(f"Yetki Yetersiz: {message.author.name} banlanamadı. Botun rolü üyenin rolünden üstte olmalı.")
+            except discord.HTTPException:
+                await asyncio.sleep(5) # Rate limit durumunda güvenli bekleme
 
     await bot.process_commands(message)
 
@@ -124,7 +176,6 @@ async def on_member_remove(member):
 # --- Botu Çalıştır ---
 if __name__ == "__main__":
     keep_alive()
-    # Token'ı çevre değişkeninden al (Güvenlik için)
     token = os.environ.get("DISCORD_TOKEN")
     if token:
         bot.run(token)
